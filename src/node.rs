@@ -17,7 +17,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::rand::RngCore;
 use bitcoin::{Address, Amount, BlockHash};
 use lightning::bolt11_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
-use lightning::chain::Listen;
+use lightning::chain::{ChannelMonitorUpdateStatus, Listen, Watch};
 use lightning::io::Cursor;
 use lightning::ln::channel_state::ChannelDetails;
 use lightning::ln::channelmanager::{
@@ -66,6 +66,7 @@ use lightning_persister::fs_store::FilesystemStore;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
 
 use crate::bitcoind_client::ChainListener;
 use crate::event_handler::LdkEventHandler;
@@ -111,7 +112,6 @@ pub(crate) type ChainMonitor = chain::chainmonitor::ChainMonitor<
     Arc<BitcoindRpcClient>,
     Arc<NodeLogger>,
     Arc<FilesystemStore>,
-    //Arc<dyn KVStore + Send + Sync>,
 >;
 
 pub(crate) type ChannelManager = channelmanager::ChannelManager<
@@ -414,13 +414,20 @@ impl NodeBuilder {
                 Arc::clone(&onion_message_router),
                 Arc::clone(&logger),
                 self.ldk_config,
-                channel_monitor_references,
+                channel_monitor_references.clone(),
             );
 
             let file = File::open(kv_store_path.join("manager"))?;
             let (_block_hash, channel_manager) =
                 <(BlockHash, ChannelManager)>::read(&mut BufReader::new(file), read_args)
                     .map_err(|e| format!("Could not read channel manager from disk {e}"))?;
+
+            for monitor in channel_monitor_references {
+                let update_status = chain_monitor
+                    .watch_channel(monitor.get_funding_txo().0, monitor.clone())
+                    .map_err(|_| "Could not pass Channel Monitors to the Chain Monitor")?;
+                assert!(update_status == ChannelMonitorUpdateStatus::Completed);
+            }
 
             Arc::new(channel_manager)
         };
@@ -478,6 +485,8 @@ impl NodeBuilder {
             .get_node_id(Recipient::Node)
             .map_err(|()| "could not get node id")?;
 
+        let cancellation_token = CancellationToken::new();
+
         Ok(Node {
             //ldk_config: self.ldk_config,
             node_id,
@@ -493,6 +502,7 @@ impl NodeBuilder {
             logger,
             payment_store,
             bitcoind_client,
+            shutdown_token: cancellation_token,
         })
     }
 }
@@ -513,6 +523,7 @@ pub struct Node {
     onion_messenger: Arc<OnionMessenger>,
     logger: Arc<NodeLogger>,
     pub(crate) payment_store: Arc<PaymentStore>,
+    shutdown_token: CancellationToken,
 }
 
 impl Node {
@@ -618,7 +629,6 @@ impl Node {
                 },
             )
             .await
-            .expect("Failed to process events");
         });
 
         // Pass blocks to ldk
@@ -708,9 +718,14 @@ impl Node {
             }
         });
 
-        // Stop the background processing.
-        // stop_sender.send(()).unwrap();
-        handle.await.unwrap();
+        // Wait for shutdown signal and stop background processing
+        self.shutdown_token.cancelled().await;
+        stop_sender.send(()).unwrap();
+
+        let _ = handle.await.unwrap();
+
+        // write peers to disk
+        self.peer_manager.disconnect_all_peers();
 
         Ok(())
     }
@@ -758,6 +773,10 @@ impl Node {
             })?;
 
         Ok(channel_id)
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown_token.cancel();
     }
 
     pub fn close_channel(&self, channel_id: &ChannelId) -> Result<(), Box<dyn Error>> {
