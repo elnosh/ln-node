@@ -1,5 +1,5 @@
 [package]
-name = "lightning-node"
+name = "ln-node"
 version = "0.1.0"
 edition = "2024"
 

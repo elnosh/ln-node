@@ -1,5 +1,5 @@
 use env_logger::Env;
-use lightning_node::{config::Config, node::NodeBuilder, server::UnixSocketServer};
+use ln_node::{config::Config, node::NodeBuilder, server::UnixSocketServer};
 use log::LevelFilter;
 use std::{error::Error, fs, sync::Arc};
 use tokio::signal;
@@ -10,7 +10,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("debug"))
         .filter_module("bitcoincore_rpc", LevelFilter::Off)
         .init();
-    let node_builder = NodeBuilder::new(Config::default());
+
+    let conf: Config = serde_json::from_str(&fs::read_to_string("config.json")?)?;
+
+    let mut node_builder = NodeBuilder::new(Config::default());
+    node_builder.setup_bitcoind_rpc_client(
+        conf.bitcoind_rpc_host,
+        conf.bitcoind_rpc_port,
+        conf.bitcoind_username,
+        conf.bitcoind_password,
+    );
 
     let node = node_builder.build()?;
     let node = Arc::new(node);

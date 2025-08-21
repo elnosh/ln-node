@@ -70,7 +70,7 @@ impl BitcoindRpcClient {
 
     fn confirmation_target_to_blocks(&self, target: ConfirmationTarget) -> u32 {
         match target {
-            ConfirmationTarget::MaximumFeeEstimate => 2,
+            ConfirmationTarget::MaximumFeeEstimate => 1,
             ConfirmationTarget::UrgentOnChainSweep => 2,
             ConfirmationTarget::OutputSpendingFee => 6,
             ConfirmationTarget::MinAllowedAnchorChannelRemoteFee => 1008,
@@ -111,7 +111,9 @@ impl BitcoindRpcClient {
                     let mut cache = self.fee_cache.lock().unwrap();
                     cache.insert(confirmation_target, rate);
                 }
-                Err(_) => {}
+                Err(e) => {
+                    log::error!("Could not fetch fee estimate from bitcoind {e}")
+                }
             }
             thread::sleep(Duration::from_secs(60 * 5));
         }
@@ -198,14 +200,11 @@ impl BroadcasterInterface for BitcoindRpcClient {
 }
 
 impl UtxoSource for BitcoindRpcClient {
-    fn get_block_hash_by_height<'a>(
-        &'a self,
-        block_height: u32,
-    ) -> AsyncBlockSourceResult<'a, BlockHash> {
+    fn get_block_hash_by_height(&self, block_height: u32) -> AsyncBlockSourceResult<BlockHash> {
         self.rpc_client.get_block_hash_by_height(block_height)
     }
 
-    fn is_output_unspent<'a>(&'a self, outpoint: OutPoint) -> AsyncBlockSourceResult<'a, bool> {
+    fn is_output_unspent(&self, outpoint: OutPoint) -> AsyncBlockSourceResult<bool> {
         self.rpc_client.is_output_unspent(outpoint)
     }
 }

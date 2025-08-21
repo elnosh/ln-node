@@ -1,3 +1,3 @@
-# lightning-node 
+# ln-node
 
-a lightning node to get familiar with [LDK](https://github.com/lightningdevkit/rust-lightning)
+a lightning node to play around with [LDK](https://github.com/lightningdevkit/rust-lightning)

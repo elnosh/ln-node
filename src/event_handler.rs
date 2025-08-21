@@ -5,12 +5,7 @@ use crate::{
     onchain_wallet::WalletManager,
     storage::{PaymentStatus, PaymentStore},
 };
-use bdk_wallet::SignOptions;
-use bitcoin::{Amount, FeeRate};
-use lightning::{
-    chain::chaininterface::{ConfirmationTarget, FeeEstimator},
-    events::{Event, ReplayEvent},
-};
+use lightning::events::{Event, ReplayEvent};
 use std::sync::Arc;
 
 pub struct LdkEventHandler {
@@ -34,63 +29,36 @@ impl LdkEventHandler {
                 output_script,
                 ..
             } => {
-                let mut locked_wallet = self.onchain_wallet.bdk_wallet.lock().unwrap();
-                let mut tx_builder = locked_wallet.build_tx();
-
-                let amount = Amount::from_sat(channel_value_satoshis);
-                let fee_rate = FeeRate::from_sat_per_kwu(
-                    self.bitcoind_client
-                        .get_est_sat_per_1000_weight(ConfirmationTarget::UrgentOnChainSweep)
-                        as u64,
-                );
-
-                tx_builder
-                    .add_recipient(output_script, amount)
-                    .fee_rate(fee_rate);
-
-                let mut psbt = match tx_builder.finish() {
-                    Ok(psbt) => {
-                        log::debug!("Created funding transaction: {:?}", psbt);
-                        psbt
-                    }
-                    Err(err) => {
-                        log::error!("Failed to create funding transaction: {}", err);
-                        // Force-close channel on the manager
-                        return Ok(());
-                    }
-                };
-
-                match locked_wallet.sign(&mut psbt, SignOptions::default()) {
-                    Ok(finalized) => {
-                        if !finalized {
-                            //return Err(Error::OnchainTxCreationFailed);
+                match self.onchain_wallet.build_transaction(
+                    channel_value_satoshis,
+                    output_script,
+                    Arc::clone(&self.bitcoind_client),
+                ) {
+                    Ok(funding_tx) => {
+                        let funding_txid = funding_tx.compute_txid();
+                        match self.channel_manager.funding_transaction_generated(
+                            temporary_channel_id,
+                            counterparty_node_id,
+                            funding_tx,
+                        ) {
+                            Ok(_) => {
+                                log::info!(
+                                    "Generated funding transaction {} for channel with node {}",
+                                    funding_txid,
+                                    counterparty_node_id
+                                );
+                            }
+                            Err(_) => {
+                                log::error!("Channel unavailable to create funding transaction",)
+                            }
                         }
                     }
-                    Err(err) => {
-                        log::error!("Failed to create funding transaction: {}", err);
-                        // return Err(err.into());
+                    Err(e) => {
+                        log::error!("Could not create funding transaction {}", e)
+                        // NOTE: should something be done to tell LDK we can't create the funding
+                        // tx?
                     }
                 }
-
-                let funding_tx = match psbt.extract_tx() {
-                    Ok(tx) => tx,
-                    Err(e) => {
-                        log::error!("Failed to extract transaction: {}", e);
-                        return Ok(());
-                    }
-                };
-
-                log::info!(
-                    "Generated funding transaction {}",
-                    funding_tx.compute_txid()
-                );
-
-                let _ = self.channel_manager.funding_transaction_generated(
-                    temporary_channel_id,
-                    counterparty_node_id,
-                    funding_tx,
-                );
-                return Ok(());
             }
             Event::ChannelPending {
                 channel_id,
@@ -218,8 +186,8 @@ impl LdkEventHandler {
                         payment_preimage,
                         ..
                     } => {
-                        if payment_preimage.is_some() {
-                            self.channel_manager.claim_funds(payment_preimage.unwrap());
+                        if let Some(preimage) = payment_preimage {
+                            self.channel_manager.claim_funds(preimage);
                         } else {
                             log::debug!("got unknown payment hash {:?}. Ignoring...", payment_hash)
                         }

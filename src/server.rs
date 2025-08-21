@@ -61,10 +61,14 @@ impl UnixSocketServer {
                                 "open_channel" => {
                                     let pubkey = request["params"]["pubkey"].as_str().unwrap();
                                     let amount = request["params"]["amount"].as_u64().unwrap();
-                                    self.node
-                                        .open_channel(pubkey.parse().unwrap(), amount, 0)
-                                        .unwrap();
-                                    json!({ "result": "Channel opened" })
+                                    match self.node.open_channel(pubkey.parse().unwrap(), amount, 0) {
+                                        Ok(_) => {
+                                            json!({ "result": "Channel opened" })
+                                        },
+                                        Err(e) => {
+                                            json!({ "Error": e.to_string() })
+                                        },
+                                    }
                                 }
                                 "list_channels" => {
                                     let channels = self.node.list_channels();

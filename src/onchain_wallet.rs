@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use bdk_wallet::SignOptions;
 use bdk_wallet::bitcoin::Network;
 use bdk_wallet::descriptor::template::Bip84;
 use bdk_wallet::{
@@ -18,8 +19,9 @@ use bitcoin::secp256k1::ecdsa::RecoverableSignature;
 use bitcoin::secp256k1::rand::RngCore;
 use bitcoin::secp256k1::schnorr::Signature;
 use bitcoin::secp256k1::{PublicKey, Scalar, ecdsa};
-use bitcoin::{Address, NetworkKind, ScriptBuf};
+use bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
 use lightning::bolt11_invoice::RawBolt11Invoice;
+use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
 use lightning::ln::inbound_payment::ExpandedKey;
 use lightning::ln::msgs::{DecodeError, UnsignedGossipMessage};
 use lightning::ln::script::ShutdownScript;
@@ -27,6 +29,8 @@ use lightning::offers::invoice::UnsignedBolt12Invoice;
 use lightning::sign::{
     EntropySource, InMemorySigner, KeysManager, NodeSigner, Recipient, SignerProvider,
 };
+
+use crate::bitcoind_client::BitcoindRpcClient;
 
 const SEED_FILENAME: &str = "seed";
 const WALLET_FILENAME: &str = "wallet";
@@ -92,8 +96,43 @@ impl WalletManager {
         })
     }
 
-    pub fn build_transaction(&self, amount: u64, dest: ScriptBuf) -> Result<(), ()> {
-        unimplemented!()
+    pub fn build_transaction(
+        &self,
+        amount: u64,
+        dest: ScriptBuf,
+        fee_estimator: Arc<BitcoindRpcClient>,
+    ) -> Result<Transaction, Box<dyn Error>> {
+        let mut wallet_lock = self.bdk_wallet.lock().unwrap();
+        let balance = wallet_lock.balance();
+
+        let tx_amount = Amount::from_sat(amount);
+        if balance.confirmed < tx_amount {
+            return Err(
+                format!("Not enough funds to create transaction for {} sats", amount).into(),
+            );
+        }
+
+        // Would be better to use some other target number of blocks since `ConfirmationTarget` is
+        // from LDK and not really related to getting the funding transaction confirmed but
+        // `MaximumFeeEstimate` is set to a target of 1 so it's fine.
+        let fee_rate = FeeRate::from_sat_per_kwu(
+            fee_estimator.get_est_sat_per_1000_weight(ConfirmationTarget::MaximumFeeEstimate)
+                as u64,
+        );
+
+        let mut tx_builder = wallet_lock.build_tx();
+        tx_builder.add_recipient(dest, tx_amount).fee_rate(fee_rate);
+
+        let mut psbt = tx_builder.finish()?;
+
+        let finalized = wallet_lock.sign(&mut psbt, SignOptions::default())?;
+        if !finalized {
+            return Err("Could not sign transaction".into());
+        }
+
+        let signed_tx = psbt.extract_tx()?;
+
+        Ok(signed_tx)
     }
 
     pub fn next_address(&self) -> Address {

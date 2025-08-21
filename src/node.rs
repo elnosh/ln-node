@@ -255,7 +255,7 @@ impl NodeBuilder {
         self
     }
 
-    fn setup_bitcoind_rpc_client(
+    pub fn setup_bitcoind_rpc_client(
         &mut self,
         rpc_host: String,
         rpc_port: u16,
@@ -563,16 +563,14 @@ impl Node {
                 listeners.push((listener.0, &listener.1 as &(dyn Listen + Send + Sync)));
             }
 
-            let chain_tip = init::synchronize_listeners(
+            init::synchronize_listeners(
                 Arc::clone(&self.bitcoind_client),
                 self.config.network,
                 &mut cache,
                 listeners,
             )
             .await
-            .map_err(|e| e.into_inner())?;
-
-            chain_tip
+            .map_err(|e| e.into_inner())?
         };
 
         let event_handler = Arc::new(LdkEventHandler {
@@ -694,6 +692,7 @@ impl Node {
 
         // TODO:
         // - broadcast announcements (if we have open channels)
+        // - task to update fee estimates
 
         // Background task to listen for inbound connections
         let peer_manager_conn_listener = Arc::clone(&self.peer_manager);
@@ -724,7 +723,7 @@ impl Node {
 
         let _ = handle.await.unwrap();
 
-        // write peers to disk
+        // TODO: write peers to disk
         self.peer_manager.disconnect_all_peers();
 
         Ok(())
@@ -948,7 +947,7 @@ impl Node {
                     }
                 }
             }
-            None => return Err("Connection timed out".into()),
+            None => Err("Connection timed out".into()),
         }
             })
         })

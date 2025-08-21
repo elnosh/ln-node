@@ -742,33 +742,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightning-node"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bdk_bitcoind_rpc",
- "bdk_wallet",
- "bip39",
- "bitcoin",
- "chrono",
- "clap",
- "env_logger",
- "hex",
- "home",
- "lightning",
- "lightning-background-processor",
- "lightning-block-sync",
- "lightning-net-tokio",
- "lightning-persister",
- "log",
- "rand 0.9.2",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "lightning-persister"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -798,6 +771,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2cd84d4e71472035903e43caded8ecc123066ce466329ccd5ae537a8d5488c7"
 dependencies = [
  "bitcoin",
+]
+
+[[package]]
+name = "ln-node"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bdk_bitcoind_rpc",
+ "bdk_wallet",
+ "bip39",
+ "bitcoin",
+ "chrono",
+ "clap",
+ "env_logger",
+ "hex",
+ "home",
+ "lightning",
+ "lightning-background-processor",
+ "lightning-block-sync",
+ "lightning-net-tokio",
+ "lightning-persister",
+ "log",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
