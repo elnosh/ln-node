@@ -72,7 +72,7 @@ impl UnixSocketServer {
                                 }
                                 "list_channels" => {
                                     let channels = self.node.list_channels();
-                                    json!({"channels": channels })
+                                    json!({ "channels": channels })
                                 }
                                 "close_channel" => {
                                     let chan_id = request["params"]["channel_id"].as_str().unwrap();

@@ -13,12 +13,25 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 use tokio::runtime::Handle;
+use tokio::select;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::node::{ChainMonitor, ChannelManager};
 use crate::onchain_wallet::WalletManager;
+
+const CONF_TARGETS: [ConfirmationTarget; 8] = [
+    ConfirmationTarget::MaximumFeeEstimate,
+    ConfirmationTarget::UrgentOnChainSweep,
+    ConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
+    ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+    ConfirmationTarget::AnchorChannelFee,
+    ConfirmationTarget::NonAnchorChannelFee,
+    ConfirmationTarget::ChannelCloseMinimum,
+    ConfirmationTarget::OutputSpendingFee,
+];
 
 pub struct BitcoindRpcClient {
     rpc_client: RpcClient,
@@ -27,40 +40,10 @@ pub struct BitcoindRpcClient {
 
 impl BitcoindRpcClient {
     pub fn new(credentials: &str, endpoint: HttpEndpoint) -> Self {
-        let fee_cache = HashMap::from([
-            (
-                ConfirmationTarget::MaximumFeeEstimate,
-                get_fallback_fee(ConfirmationTarget::MaximumFeeEstimate),
-            ),
-            (
-                ConfirmationTarget::UrgentOnChainSweep,
-                get_fallback_fee(ConfirmationTarget::UrgentOnChainSweep),
-            ),
-            (
-                ConfirmationTarget::OutputSpendingFee,
-                get_fallback_fee(ConfirmationTarget::OutputSpendingFee),
-            ),
-            (
-                ConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
-                get_fallback_fee(ConfirmationTarget::MinAllowedAnchorChannelRemoteFee),
-            ),
-            (
-                ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
-                get_fallback_fee(ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee),
-            ),
-            (
-                ConfirmationTarget::AnchorChannelFee,
-                get_fallback_fee(ConfirmationTarget::AnchorChannelFee),
-            ),
-            (
-                ConfirmationTarget::NonAnchorChannelFee,
-                get_fallback_fee(ConfirmationTarget::NonAnchorChannelFee),
-            ),
-            (
-                ConfirmationTarget::ChannelCloseMinimum,
-                get_fallback_fee(ConfirmationTarget::ChannelCloseMinimum),
-            ),
-        ]);
+        let fallback_fees = CONF_TARGETS
+            .iter()
+            .map(|target| (target.clone(), get_fallback_fee(*target)));
+        let fee_cache = HashMap::from_iter(fallback_fees);
 
         Self {
             rpc_client: RpcClient::new(credentials, endpoint),
@@ -104,18 +87,33 @@ impl BitcoindRpcClient {
     }
 
     // method to run in a background that will poll fee estimates from bitcoin core every 5 minutes
-    async fn fetch_fee(&self, confirmation_target: ConfirmationTarget) {
-        loop {
-            match self.fetch_fee_estimate(confirmation_target).await {
-                Ok(rate) => {
-                    let mut cache = self.fee_cache.lock().unwrap();
-                    cache.insert(confirmation_target, rate);
-                }
-                Err(e) => {
-                    log::error!("Could not fetch fee estimate from bitcoind {e}")
+    pub async fn update_fee_estimates(&self, shutdown_signal: CancellationToken) {
+        let update_fees = || async {
+            for target in CONF_TARGETS {
+                match self.fetch_fee_estimate(target).await {
+                    Ok(rate) => {
+                        let mut cache = self.fee_cache.lock().unwrap();
+                        cache.insert(target, rate);
+                    }
+                    Err(e) => {
+                        log::error!("Could not fetch fee estimate from bitcoind {e}")
+                    }
                 }
             }
-            thread::sleep(Duration::from_secs(60 * 5));
+            log::info!("Updated fee estimates");
+        };
+
+        update_fees().await;
+
+        loop {
+            select! {
+                _ = sleep(Duration::from_secs(60 * 5)) => {
+                    update_fees().await;
+                }
+                _ = shutdown_signal.cancelled() => {
+                    break
+                }
+            }
         }
     }
 

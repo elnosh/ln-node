@@ -3,16 +3,19 @@ use crate::{
     config::Config,
     node::ChannelManager,
     onchain_wallet::WalletManager,
-    storage::{PaymentStatus, PaymentStore},
+    storage::{NodeStore, PaymentStatus},
 };
-use lightning::events::{Event, ReplayEvent};
+use lightning::{
+    events::{Event, ReplayEvent},
+    util::errors::APIError,
+};
 use std::sync::Arc;
 
 pub struct LdkEventHandler {
     pub(crate) bitcoind_client: Arc<BitcoindRpcClient>,
     pub(crate) onchain_wallet: Arc<WalletManager>,
     pub(crate) channel_manager: Arc<ChannelManager>,
-    pub(crate) payment_store: Arc<PaymentStore>,
+    pub(crate) node_store: Arc<NodeStore>,
     pub(crate) config: Config,
 }
 
@@ -120,10 +123,29 @@ impl LdkEventHandler {
                     }
                 }
 
-                // TODO: user_channel_id and do not unwrap
-                self.channel_manager
-                    .accept_inbound_channel(&temporary_channel_id, &counterparty_node_id, 0)
-                    .unwrap();
+                // TODO: user_channel_id
+                match self.channel_manager.accept_inbound_channel(
+                    &temporary_channel_id,
+                    &counterparty_node_id,
+                    0,
+                ) {
+                    Ok(_) => {
+                        log::info!(
+                            "Accepted channel {} from {} for {} sats",
+                            temporary_channel_id,
+                            counterparty_node_id,
+                            funding_satoshis
+                        );
+                    }
+                    Err(e) => match e {
+                        APIError::APIMisuseError { err } | APIError::ChannelUnavailable { err } => {
+                            log::error!("Could not accept channel {}", err)
+                        }
+                        _ => {
+                            log::error!("Could not accept channel")
+                        }
+                    },
+                }
             }
             Event::ChannelClosed {
                 channel_id,
@@ -146,7 +168,7 @@ impl LdkEventHandler {
                 payment_hash,
                 fee_paid_msat,
                 ..
-            } => match self.payment_store.get_payment(&payment_hash) {
+            } => match self.node_store.get_payment(&payment_hash) {
                 Ok(mut payment) => {
                     log::info!(
                         "Payment {} for amount {} sent successfully. Preimage: {}. Paid fee {}",
@@ -161,7 +183,7 @@ impl LdkEventHandler {
                     payment.fee_paid_msat = fee_paid_msat;
                     // TODO: set payment updated timestamp
 
-                    if self.payment_store.update_payment(payment).is_err() {
+                    if self.node_store.update_payment(payment).is_err() {
                         log::error!(
                             "Could not update existing payment in store. Something really wrong..."
                         )
@@ -202,22 +224,22 @@ impl LdkEventHandler {
                 reason,
             } => {
                 if payment_hash.is_some() {
-                    match self.payment_store.get_payment(&payment_hash.unwrap()) {
+                    match self.node_store.get_payment(&payment_hash.unwrap()) {
                         Ok(mut payment) => {
                             log::info!(
                                 "Payment {:?} failed with reason {:?}",
                                 payment_hash,
-                                reason.unwrap()
+                                reason.unwrap() // Safe to unwrap because this will only be none
+                                                // for LDK versions prior to 0.0.115
                             );
                             payment.status = PaymentStatus::Failed;
 
-                            let _ = self.payment_store.update_payment(payment);
+                            let _ = self.node_store.update_payment(payment);
                         }
                         Err(e) => {
                             log::error!(
-                                "Could not retrieve payment {:?} during PaymentFailed notification. Error {}",
+                                "Could not retrieve payment {:?} during PaymentFailed notification. Error {e}",
                                 payment_hash,
-                                e
                             )
                         }
                     }

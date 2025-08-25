@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     fs::exists,
@@ -15,7 +15,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::key::rand::rngs::OsRng;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::secp256k1::rand::RngCore;
-use bitcoin::{Address, Amount, BlockHash};
+use bitcoin::{Address, Amount, BlockHash, OutPoint};
 use lightning::bolt11_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use lightning::chain::{ChannelMonitorUpdateStatus, Listen, Watch};
 use lightning::io::Cursor;
@@ -23,7 +23,8 @@ use lightning::ln::channel_state::ChannelDetails;
 use lightning::ln::channelmanager::{
     Bolt11InvoiceParameters, ChannelManagerReadArgs, PaymentId, RecipientOnionFields, Retry,
 };
-use lightning::ln::peer_handler::MessageHandler;
+use lightning::ln::msgs::SocketAddress;
+use lightning::ln::peer_handler::{MessageHandler, PeerDetails};
 use lightning::ln::types::ChannelId;
 use lightning::routing::router::{PaymentParameters, RouteParameters};
 use lightning::sign::{NodeSigner, Recipient};
@@ -64,16 +65,16 @@ use lightning_block_sync::{gossip::TokioSpawner, http::HttpEndpoint};
 use lightning_net_tokio::SocketDescriptor as LdkTokioSocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Serializer};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use crate::bitcoind_client::ChainListener;
 use crate::event_handler::LdkEventHandler;
-use crate::storage::{Payment, PaymentDirection, PaymentStatus};
+use crate::storage::{Payment, PaymentDirection, PaymentStatus, PeerInfo};
 use crate::{
     bitcoind_client::BitcoindRpcClient, config::Config, logger::NodeLogger,
-    onchain_wallet::WalletManager, storage::PaymentStore,
+    onchain_wallet::WalletManager, storage::NodeStore,
 };
 
 type NetworkGraph = gossip::NetworkGraph<Arc<NodeLogger>>;
@@ -159,17 +160,17 @@ type PeerManager = ln::peer_handler::PeerManager<
     Arc<WalletManager>,
 >;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct ChannelInfo {
-    //pub channel_id: ChannelId,
-    pub channel_id: [u8; 32],
+    #[serde(serialize_with = "serialize_channel_id")]
+    pub channel_id: ChannelId,
     pub counterparty: PublicKey,
-    // pub funding_txo: Option<OutPoint>,
+    pub funding_txo: Option<OutPoint>,
     pub short_channel_id: Option<u64>,
-    pub channel_value_satoshis: u64,
-    // pub user_channel_id: u128,
-    pub outbound_capacity_msat: u64,
-    pub inbound_capacity_msat: u64,
+    pub channel_value_sat: u64,
+    pub local_reserve: Option<u64>,
+    pub outbound_capacity_sat: u64,
+    pub inbound_capacity_sat: u64,
     pub confirmations_required: Option<u32>,
     pub is_outbound: bool,
     pub is_channel_ready: bool,
@@ -180,13 +181,16 @@ pub struct ChannelInfo {
 impl From<&ChannelDetails> for ChannelInfo {
     fn from(value: &ChannelDetails) -> Self {
         Self {
-            channel_id: value.channel_id.0,
+            channel_id: value.channel_id,
             counterparty: value.counterparty.node_id,
+            funding_txo: value
+                .funding_txo
+                .and_then(|tx| Some(tx.into_bitcoin_outpoint())),
             short_channel_id: value.short_channel_id,
-            channel_value_satoshis: value.channel_value_satoshis,
-            //user_channel_id: value.user_channel_id,
-            outbound_capacity_msat: value.outbound_capacity_msat,
-            inbound_capacity_msat: value.inbound_capacity_msat,
+            channel_value_sat: value.channel_value_satoshis,
+            local_reserve: value.unspendable_punishment_reserve,
+            outbound_capacity_sat: value.outbound_capacity_msat / 1000,
+            inbound_capacity_sat: value.inbound_capacity_msat / 1000,
             confirmations_required: value.confirmations_required,
             is_outbound: value.is_outbound,
             is_channel_ready: value.is_channel_ready,
@@ -194,6 +198,13 @@ impl From<&ChannelDetails> for ChannelInfo {
             is_announced: value.is_announced,
         }
     }
+}
+
+fn serialize_channel_id<S>(channel_id: &ChannelId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&hex::encode(channel_id.0))
 }
 
 pub struct Balance {
@@ -359,10 +370,7 @@ impl NodeBuilder {
             Arc::clone(&wallet_manager),
         ));
 
-        let cur_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32;
+        let cur_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as u32;
 
         let channel_manager = if !exists(&kv_store_path)? {
             // Create new ChannelManager from scratch
@@ -479,7 +487,7 @@ impl NodeBuilder {
         // then initialize the verifier with the gossip sync to now add it here.
         gossip_sync.add_utxo_lookup(Some(gossip_verifier));
 
-        let payment_store = Arc::new(PaymentStore::new(node_path.clone()));
+        let node_store = Arc::new(NodeStore::new(node_path.clone()));
 
         let node_id = wallet_manager
             .get_node_id(Recipient::Node)
@@ -500,7 +508,7 @@ impl NodeBuilder {
             scorer,
             onion_messenger,
             logger,
-            payment_store,
+            node_store,
             bitcoind_client,
             shutdown_token: cancellation_token,
         })
@@ -522,7 +530,7 @@ pub struct Node {
     scorer: Arc<Mutex<Scorer>>,
     onion_messenger: Arc<OnionMessenger>,
     logger: Arc<NodeLogger>,
-    pub(crate) payment_store: Arc<PaymentStore>,
+    pub(crate) node_store: Arc<NodeStore>,
     shutdown_token: CancellationToken,
 }
 
@@ -573,11 +581,52 @@ impl Node {
             .map_err(|e| e.into_inner())?
         };
 
+        let fee_bitcoind_client = Arc::clone(&self.bitcoind_client);
+        let fee_cancellation_token = self.shutdown_token.clone();
+        // background task to update fee estimates
+        tokio::spawn(async move {
+            fee_bitcoind_client
+                .update_fee_estimates(fee_cancellation_token)
+                .await;
+        });
+
+        // reconnect to peers on startup
+        let reconnect_peer_manager = Arc::clone(&self.peer_manager);
+        let peer_store = Arc::clone(&self.node_store);
+        tokio::spawn(async move {
+            let peers_stored = peer_store.list_peers()?;
+
+            for peer in peers_stored {
+                let addr = match peer.address {
+                    SocketAddress::TcpIpV4 { addr, port } => {
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), port)
+                    }
+                    SocketAddress::TcpIpV6 { addr, port } => {
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr)), port)
+                    }
+                    _ => {
+                        continue;
+                    }
+                };
+
+                match connect(Arc::clone(&reconnect_peer_manager), &peer.node_id, addr) {
+                    Ok(_) => {
+                        log::info!("Connected to peer {}", peer.node_id);
+                    }
+                    Err(e) => {
+                        log::error!("Could not reconnect to peer {e}");
+                    }
+                }
+            }
+
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        });
+
         let event_handler = Arc::new(LdkEventHandler {
             bitcoind_client: Arc::clone(&self.bitcoind_client),
             onchain_wallet: Arc::clone(&self.onchain_wallet),
             channel_manager: Arc::clone(&self.channel_manager),
-            payment_store: Arc::clone(&self.payment_store),
+            node_store: Arc::clone(&self.node_store),
             config: self.config.clone(),
         });
 
@@ -619,11 +668,9 @@ impl Node {
                 sleeper,
                 mobile_interruptable_platform,
                 || {
-                    Some(
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap(),
-                    )
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .ok()
                 },
             )
             .await
@@ -692,9 +739,8 @@ impl Node {
 
         // TODO:
         // - broadcast announcements (if we have open channels)
-        // - task to update fee estimates
 
-        // Background task to listen for inbound connections
+        // background task to listen for inbound connections
         let peer_manager_conn_listener = Arc::clone(&self.peer_manager);
         tokio::spawn(async move {
             // TODO: handle unwraps
@@ -723,8 +769,35 @@ impl Node {
 
         let _ = handle.await.unwrap();
 
-        // TODO: write peers to disk
-        self.peer_manager.disconnect_all_peers();
+        // write peers to disk before shutdown
+        {
+            let peers: Vec<PeerDetails> = self.peer_manager.list_peers();
+            for peer in peers {
+                let address = match peer.socket_address {
+                    Some(address) => address,
+                    None => {
+                        // If we are connected to them, we must have an address so it shouldn't get
+                        // to here.
+                        log::error!("Could not save peer {} to store", peer.counterparty_node_id);
+                        continue;
+                    }
+                };
+
+                let peer_info = PeerInfo {
+                    node_id: peer.counterparty_node_id,
+                    address,
+                };
+                match self.node_store.add_peer(&peer_info) {
+                    Ok(_) => {
+                        log::info!("Saved peer to store {:?}", peer_info);
+                    }
+                    Err(e) => {
+                        log::error!("Could not save peer {e} to store");
+                    }
+                }
+            }
+            self.peer_manager.disconnect_all_peers();
+        }
 
         Ok(())
     }
@@ -825,7 +898,7 @@ impl Node {
         if let Some(features) = invoice.features() {
             payment_params = payment_params
                 .with_bolt11_features(features.clone())
-                .unwrap();
+                .map_err(|_| "could not parse invoice features")?
         }
 
         let amount = match invoice.amount_milli_satoshis() {
@@ -887,7 +960,7 @@ impl Node {
             fee_paid_msat: None,
             status: PaymentStatus::Pending,
         };
-        self.payment_store.add_payment(payment)?;
+        self.node_store.add_payment(payment)?;
 
         Ok(bolt11_invoice)
     }
@@ -921,35 +994,42 @@ impl Node {
         peer_pubkey: &PublicKey,
         peer_addr: SocketAddr,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        tokio::task::block_in_place(move || {
-            Handle::current().block_on(async move {
-        match lightning_net_tokio::connect_outbound(
-            Arc::clone(&self.peer_manager),
-            *peer_pubkey,
-            peer_addr,
-        )
-        .await
-        {
-            Some(connection_closed_future) => {
-                let mut connection_closed_future = Box::pin(connection_closed_future);
-                loop {
-                    tokio::select! {
-                        _ = &mut connection_closed_future => return Err("Connection closed".into()),
-                        _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-                    }
-                    if self
-                        .peer_manager
-                        .list_peers()
-                        .iter()
-                        .any(|peer| peer.counterparty_node_id == *peer_pubkey)
-                    {
-                        return Ok(());
+        connect(Arc::clone(&self.peer_manager), peer_pubkey, peer_addr)
+    }
+}
+
+fn connect(
+    peer_manager: Arc<PeerManager>,
+    peer_pubkey: &PublicKey,
+    peer_addr: SocketAddr,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    tokio::task::block_in_place(move || {
+        Handle::current().block_on(async move {
+            match lightning_net_tokio::connect_outbound(
+                Arc::clone(&peer_manager),
+                *peer_pubkey,
+                peer_addr,
+            )
+            .await
+            {
+                Some(connection_closed_future) => {
+                    let mut connection_closed_future = Box::pin(connection_closed_future);
+                    loop {
+                        tokio::select! {
+                            _ = &mut connection_closed_future => return Err("Connection closed".into()),
+                            _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                        }
+                        if peer_manager
+                            .list_peers()
+                            .iter()
+                            .any(|peer| peer.counterparty_node_id == *peer_pubkey)
+                        {
+                            return Ok(());
+                        }
                     }
                 }
+                None => Err("Connection timed out".into()),
             }
-            None => Err("Connection timed out".into()),
-        }
-            })
         })
-    }
+    })
 }
