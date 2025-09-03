@@ -19,14 +19,16 @@ use bitcoin::{Address, Amount, BlockHash, OutPoint};
 use lightning::bolt11_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use lightning::chain::{ChannelMonitorUpdateStatus, Listen, Watch};
 use lightning::io::Cursor;
+use lightning::ln::bolt11_payment::{
+    payment_parameters_from_invoice, payment_parameters_from_variable_amount_invoice,
+};
 use lightning::ln::channel_state::ChannelDetails;
 use lightning::ln::channelmanager::{
-    Bolt11InvoiceParameters, ChannelManagerReadArgs, PaymentId, RecipientOnionFields, Retry,
+    Bolt11InvoiceParameters, ChannelManagerReadArgs, PaymentId, Retry,
 };
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::peer_handler::{MessageHandler, PeerDetails};
 use lightning::ln::types::ChannelId;
-use lightning::routing::router::{PaymentParameters, RouteParameters};
 use lightning::sign::{NodeSigner, Recipient};
 use lightning::types::payment::PaymentHash;
 use lightning::util::errors::APIError;
@@ -738,7 +740,7 @@ impl Node {
         });
 
         // TODO:
-        // - broadcast announcements (if we have open channels)
+        // - broadcast announcements (if we have public channels)
 
         // background task to listen for inbound connections
         let peer_manager_conn_listener = Arc::clone(&self.peer_manager);
@@ -881,50 +883,50 @@ impl Node {
         &self,
         invoice: Bolt11Invoice,
         amount_msat: Option<u64>,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut recipient_onion = RecipientOnionFields::secret_only(*invoice.payment_secret());
-        recipient_onion.payment_metadata = invoice.payment_metadata().map(|v| v.clone());
-
-        let mut payment_params = PaymentParameters::from_node_id(
-            invoice.recover_payee_pub_key(),
-            invoice.min_final_cltv_expiry_delta() as u32,
-        )
-        .with_route_hints(invoice.route_hints())
-        .map_err(|_| "invalid invoice")?;
-
-        if let Some(expiry) = invoice.expires_at() {
-            payment_params = payment_params.with_expiry_time(expiry.as_secs());
-        }
-        if let Some(features) = invoice.features() {
-            payment_params = payment_params
-                .with_bolt11_features(features.clone())
-                .map_err(|_| "could not parse invoice features")?
-        }
-
-        let amount = match invoice.amount_milli_satoshis() {
-            Some(a) => a,
-            None => amount_msat.ok_or("amount not specified for amountless invoice")?,
+    ) -> Result<PaymentId, Box<dyn Error>> {
+        let (payment_hash, recipient_onion, route_params) = match invoice.amount_milli_satoshis() {
+            Some(_) => {
+                payment_parameters_from_invoice(&invoice).map_err(|_| "could not parse invoice")?
+            }
+            None => {
+                let amount = amount_msat.ok_or("amount not specified for amountless invoice")?;
+                payment_parameters_from_variable_amount_invoice(&invoice, amount)
+                    .map_err(|_| "could not parse invoice")?
+            }
         };
 
-        let route_params = RouteParameters::from_payment_params_and_value(payment_params, amount);
-
-        // TODO: save payment in store
         // NOTE: future releases of LDK will have a `pay_for_bolt11_invoice` method that could be
-        // used instead. It does most of the parsing and params setup as done here.
+        // used instead.
 
-        let payment_hash = invoice.payment_hash().to_byte_array();
+        let payment_id = PaymentId(payment_hash.0);
         self.channel_manager
             .send_payment(
-                PaymentHash(payment_hash),
+                payment_hash,
                 recipient_onion,
-                PaymentId(payment_hash),
+                payment_id,
                 route_params,
                 Retry::Timeout(Duration::from_secs(15)),
             )
             // TODO: properly handle error
-            .map_err(|_e| "error making payment")?;
+            .map_err(|e| format!("Could not make payment {:?}", e))?;
 
-        Ok(())
+        let amount = invoice
+            .amount_milli_satoshis()
+            // safe because we already checked above
+            .unwrap_or(amount_msat.unwrap());
+
+        let payment = Payment {
+            payment_hash,
+            payment_preimage: None,
+            payment_id,
+            direction: PaymentDirection::Outbound,
+            amount_msat: Some(amount),
+            fee_paid_msat: None,
+            status: PaymentStatus::Pending,
+        };
+        self.node_store.add_payment(payment)?;
+
+        Ok(payment_id)
     }
 
     pub fn create_bolt11_invoice(
@@ -951,18 +953,23 @@ impl Node {
                 }
             })?;
 
+        let payment_hash = bolt11_invoice.payment_hash().to_byte_array();
         let payment = Payment {
-            payment_hash: PaymentHash(bolt11_invoice.payment_hash().to_byte_array()),
+            payment_hash: PaymentHash(payment_hash),
             payment_preimage: None,
+            payment_id: PaymentId(payment_hash),
             direction: PaymentDirection::Inbound,
-            // TODO: don't do this
-            amount_msat: amount_msat.unwrap_or(0),
+            amount_msat,
             fee_paid_msat: None,
             status: PaymentStatus::Pending,
         };
         self.node_store.add_payment(payment)?;
 
         Ok(bolt11_invoice)
+    }
+
+    pub fn get_payment(&self, payment_id: PaymentId) -> Option<Payment> {
+        self.node_store.get_payment(&payment_id).ok()
     }
 
     pub fn new_onchain_address(&self) -> Address {

@@ -108,7 +108,7 @@ fn close_channel(channel_id: String) {
     let request = json!({
         "method": "close_channel",
         "params": {
-            "chan_id": channel_id
+            "channel_id": channel_id
         }
     });
     stream.write_all(request.to_string().as_bytes()).unwrap();

@@ -54,7 +54,7 @@ impl BitcoindRpcClient {
     fn confirmation_target_to_blocks(&self, target: ConfirmationTarget) -> u32 {
         match target {
             ConfirmationTarget::MaximumFeeEstimate => 1,
-            ConfirmationTarget::UrgentOnChainSweep => 2,
+            ConfirmationTarget::UrgentOnChainSweep => 1,
             ConfirmationTarget::OutputSpendingFee => 6,
             ConfirmationTarget::MinAllowedAnchorChannelRemoteFee => 1008,
             ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee => 144,
@@ -91,8 +91,11 @@ impl BitcoindRpcClient {
         let update_fees = || async {
             for target in CONF_TARGETS {
                 match self.fetch_fee_estimate(target).await {
-                    Ok(rate) => {
+                    Ok(mut rate) => {
                         let mut cache = self.fee_cache.lock().unwrap();
+                        if target == ConfirmationTarget::MaximumFeeEstimate {
+                            rate = rate.saturating_add(2500);
+                        };
                         cache.insert(target, rate);
                     }
                     Err(e) => {
@@ -144,7 +147,7 @@ impl BitcoindRpcClient {
 
 fn get_fallback_fee(confirmation_target: ConfirmationTarget) -> u32 {
     match confirmation_target {
-        ConfirmationTarget::MaximumFeeEstimate => 5000,
+        ConfirmationTarget::MaximumFeeEstimate => 10000,
         ConfirmationTarget::UrgentOnChainSweep => 5000,
         ConfirmationTarget::OutputSpendingFee => 4000,
         ConfirmationTarget::MinAllowedAnchorChannelRemoteFee => 253,

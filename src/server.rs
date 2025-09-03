@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bitcoin::secp256k1::PublicKey;
 use lightning::bolt11_invoice::Bolt11Invoice;
+use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::types::ChannelId;
 use serde_json::json;
 use tokio::net::UnixListener;
@@ -56,7 +57,7 @@ impl UnixSocketServer {
                                 }
                                 "balance" => {
                                     let balance = self.node.balance();
-                                    json!({ "onchain": { "confirmed": balance.onchain_confirmed, "pending": balance.onchain_pending }, "lightning": balance.lightning })
+                                    json!({ "onchain": { "confirmed": balance.onchain_confirmed.to_btc(), "pending": balance.onchain_pending }, "lightning": balance.lightning })
                                 }
                                 "open_channel" => {
                                     let pubkey = request["params"]["pubkey"].as_str().unwrap();
@@ -89,16 +90,34 @@ impl UnixSocketServer {
                                 }
                                 "send_payment" => {
                                     let invoice = request["params"]["invoice"].as_str().unwrap();
-                                    self.node
-                                        .pay_bolt11_invoice(Bolt11Invoice::from_str(invoice).unwrap(), None)
-                                        .unwrap();
-                                    json!({ "result": "Payment sent" })
+                                    match self.node.pay_bolt11_invoice(Bolt11Invoice::from_str(invoice).unwrap(), None) {
+                                        Ok(payment_id) => {
+                                            let hex_id = hex::encode(payment_id.0);
+                                            json!({ "payment_id": hex_id })
+                                        },
+                                        Err(e) => {
+                                            json!({ "result": format!("Could not make payment: {}", e)})
+                                        }
+                                    }
                                 }
                                 "receive" => {
                                     let amount_msat = request["params"]["amount"].as_u64().unwrap();
                                     let bolt11 =
                                         self.node.create_bolt11_invoice(Some(amount_msat)).unwrap();
                                     json!({"invoice": bolt11.to_string()})
+                                }
+                                "get_payment" => {
+                                    let payment_id = hex::decode(request["params"]["payment_id"].as_str().unwrap()).unwrap();
+                                    let payment_id: PaymentId = PaymentId(payment_id.try_into().unwrap());
+
+                                    match self.node.get_payment(payment_id) {
+                                        Some(payment) => {
+                                            json!(payment)
+                                        },
+                                        None => {
+                                            json!({ "result": "Payment not found" })
+                                        }
+                                    }
                                 }
                                 "connect" => {
                                     let node_pubkey = request["params"]["pubkey"].as_str().unwrap();

@@ -3,7 +3,7 @@ use std::sync::RwLock;
 
 use bitcoin::secp256k1::PublicKey;
 use lightning::{
-    ln::msgs::SocketAddress,
+    ln::{channelmanager::PaymentId, msgs::SocketAddress},
     types::payment::{PaymentHash, PaymentPreimage},
     util::persist::KVStore,
 };
@@ -23,7 +23,7 @@ pub enum PaymentDirection {
     Outbound,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaymentStatus {
     Pending,
     Succeeded,
@@ -32,6 +32,11 @@ pub enum PaymentStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Payment {
+    #[serde(
+        serialize_with = "serialize_payment_id",
+        deserialize_with = "deserialize_payment_id"
+    )]
+    pub payment_id: PaymentId,
     #[serde(
         serialize_with = "serialize_payment_hash",
         deserialize_with = "deserialize_payment_hash"
@@ -43,11 +48,10 @@ pub struct Payment {
     )]
     pub payment_preimage: Option<PaymentPreimage>,
     pub direction: PaymentDirection,
-    pub amount_msat: u64,
+    pub amount_msat: Option<u64>,
     pub fee_paid_msat: Option<u64>,
-    // TODO: re-add these fields
-    // pub payment_id: String,
     pub status: PaymentStatus,
+    // TODO: re-add these fields
     // pub created_at: u64,
     // pub updated_at: u64,
 }
@@ -70,6 +74,26 @@ where
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&bytes);
     Ok(PaymentHash(hash))
+}
+
+fn serialize_payment_id<S>(payment_id: &PaymentId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_bytes(&payment_id.0)
+}
+
+fn deserialize_payment_id<'de, D>(deserializer: D) -> Result<PaymentId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let bytes = <Vec<u8>>::deserialize(deserializer)?;
+    if bytes.len() != 32 {
+        return Err(serde::de::Error::custom("PaymentId must be 32 bytes"));
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&bytes);
+    Ok(PaymentId(hash))
 }
 
 fn serialize_payment_preimage<S>(
@@ -193,7 +217,7 @@ impl NodeStore {
     // intended for anything important.
 
     pub fn add_payment(&self, payment: Payment) -> Result<(), lightning::io::Error> {
-        let key = hex::encode(payment.payment_hash.0);
+        let key = hex::encode(payment.payment_id.0);
         let serialized = serde_json::to_vec(&payment)
             .map_err(|e| lightning::io::Error::new(lightning::io::ErrorKind::InvalidData, e))?;
 
@@ -209,8 +233,8 @@ impl NodeStore {
         self.add_payment(payment)
     }
 
-    pub fn get_payment(&self, payment_hash: &PaymentHash) -> Result<Payment, lightning::io::Error> {
-        let key = hex::encode(payment_hash.0);
+    pub fn get_payment(&self, payment_id: &PaymentId) -> Result<Payment, lightning::io::Error> {
+        let key = hex::encode(payment_id.0);
 
         match self.store.read().unwrap().read(
             PAYMENTS_PRIMARY_NAMESPACE,
@@ -253,8 +277,8 @@ impl NodeStore {
         Ok(payments)
     }
 
-    pub fn remove_payment(&self, payment_hash: &PaymentHash) -> Result<(), lightning::io::Error> {
-        let key = hex::encode(payment_hash.0);
+    pub fn remove_payment(&self, payment_id: &PaymentId) -> Result<(), lightning::io::Error> {
+        let key = hex::encode(payment_id.0);
         self.store.write().unwrap().remove(
             PAYMENTS_PRIMARY_NAMESPACE,
             PAYMENTS_SECONDARY_NAMESPACE,

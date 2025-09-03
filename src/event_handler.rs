@@ -155,7 +155,7 @@ impl LdkEventHandler {
                 ..
             } => {
                 log::info!(
-                    "Channel {} with peer {} got closed. REASON: {}",
+                    "Channel {} with peer {} got closed. Reason: {}",
                     channel_id,
                     user_channel_id,
                     reason
@@ -164,16 +164,18 @@ impl LdkEventHandler {
 
             // -------- Payment-related events --------
             Event::PaymentSent {
+                payment_id,
                 payment_preimage,
                 payment_hash,
                 fee_paid_msat,
                 ..
-            } => match self.node_store.get_payment(&payment_hash) {
+            } => match self.node_store.get_payment(&payment_id.unwrap()) {
                 Ok(mut payment) => {
                     log::info!(
                         "Payment {} for amount {} sent successfully. Preimage: {}. Paid fee {}",
                         payment_hash,
-                        payment.amount_msat,
+                        // the amount is always Some when sending
+                        payment.amount_msat.unwrap(),
                         payment_preimage,
                         fee_paid_msat.unwrap(), // Safe to unwrap because this will only be none
                                                 // for LDK versions prior to 0.0.103
@@ -191,8 +193,7 @@ impl LdkEventHandler {
                 }
                 Err(e) => {
                     log::error!(
-                        "Could not retrieve payment from store: {}. Something really wrong...",
-                        e
+                        "Could not retrieve payment from store: {e}. Something really wrong..."
                     )
                 }
             },
@@ -219,12 +220,12 @@ impl LdkEventHandler {
             }
             Event::PaymentClaimed { .. } => {}
             Event::PaymentFailed {
-                payment_id: _,
+                payment_id,
                 payment_hash,
                 reason,
             } => {
                 if payment_hash.is_some() {
-                    match self.node_store.get_payment(&payment_hash.unwrap()) {
+                    match self.node_store.get_payment(&payment_id) {
                         Ok(mut payment) => {
                             log::info!(
                                 "Payment {:?} failed with reason {:?}",
@@ -252,8 +253,8 @@ impl LdkEventHandler {
                 payment_hash,
                 path,
             } => {
-                log::info!("Payment {} took path {:?}", payment_hash.unwrap(), path); // Safe to
-                // unwrap the hash. Will only be none for payments before LDK 0.0.104
+                // Safe to unwrap the hash. Will only be none for payments before LDK 0.0.104
+                log::info!("Payment {} took path {:?}", payment_hash.unwrap(), path);
             }
             Event::PaymentForwarded { .. } => {}
             // Not handling bolt12 invoices manually.
