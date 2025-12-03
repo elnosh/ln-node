@@ -7,9 +7,8 @@ use std::time::SystemTime;
 use bdk_wallet::SignOptions;
 use bdk_wallet::bitcoin::Network;
 use bdk_wallet::descriptor::template::Bip84;
-use bdk_wallet::{
-    ChangeSet, KeychainKind, PersistedWallet, Wallet as BdkWallet, file_store::Store,
-};
+use bdk_wallet::rusqlite::Connection;
+use bdk_wallet::{KeychainKind, PersistedWallet, Wallet as BdkWallet};
 use bip39::Mnemonic;
 use bitcoin::bip32::ChildNumber;
 use bitcoin::key::Secp256k1;
@@ -22,6 +21,7 @@ use bitcoin::secp256k1::{PublicKey, Scalar, ecdsa};
 use bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
 use lightning::bolt11_invoice::RawBolt11Invoice;
 use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
+use lightning::events::bump_transaction::{Utxo, WalletSource};
 use lightning::ln::inbound_payment::ExpandedKey;
 use lightning::ln::msgs::{DecodeError, UnsignedGossipMessage};
 use lightning::ln::script::ShutdownScript;
@@ -33,11 +33,12 @@ use lightning::sign::{
 use crate::bitcoind_client::BitcoindRpcClient;
 
 const SEED_FILENAME: &str = "seed";
-const WALLET_FILENAME: &str = "wallet";
+const WALLET_FILENAME: &str = "wallet.sqlite3";
 
+// TODO: bdk_wallet properly persist after changes
 pub struct WalletManager {
     ldk_keys_manager: KeysManager,
-    pub(crate) bdk_wallet: Arc<Mutex<PersistedWallet<Store<ChangeSet>>>>,
+    pub(crate) bdk_wallet: Arc<Mutex<PersistedWallet<Connection>>>,
 }
 
 impl WalletManager {
@@ -52,22 +53,19 @@ impl WalletManager {
             OsRng.fill_bytes(&mut entropy);
             Mnemonic::from_entropy(&entropy)?
         };
-
         let seed = mnemonic.to_seed_normalized("");
-
-        let (mut store, _) = Store::load_or_create("lightning-node".as_bytes(), &wallet_path)?;
-
         let xpriv = bitcoin::bip32::Xpriv::new_master(NetworkKind::Test, &seed)?;
         // BIP-84 P2WPKH
         let descriptor = Bip84(xpriv, KeychainKind::External);
         let change_descriptor = Bip84(xpriv, KeychainKind::Internal);
 
+        let mut conn = Connection::open(wallet_path)?;
         let wallet_opt = BdkWallet::load()
             .descriptor(KeychainKind::External, Some(descriptor.clone()))
             .descriptor(KeychainKind::Internal, Some(change_descriptor.clone()))
             .extract_keys()
             .check_network(network)
-            .load_wallet(&mut store)?;
+            .load_wallet(&mut conn)?;
 
         let wallet = match wallet_opt {
             Some(wallet) => wallet,
@@ -75,7 +73,7 @@ impl WalletManager {
                 fs::write(seed_path, mnemonic.to_string())?;
                 BdkWallet::create(descriptor, change_descriptor)
                     .network(network)
-                    .create_wallet(&mut store)?
+                    .create_wallet(&mut conn)?
             }
         };
 
@@ -226,6 +224,7 @@ impl SignerProvider for WalletManager {
             .lock()
             .unwrap()
             .next_unused_address(KeychainKind::External);
+        // TODO: persist wallet here
         Ok(address.script_pubkey())
     }
 
@@ -235,6 +234,46 @@ impl SignerProvider for WalletManager {
             .lock()
             .unwrap()
             .next_unused_address(KeychainKind::External);
+        // TODO: persist wallet here
         Ok(address.script_pubkey().try_into().unwrap())
+    }
+}
+
+impl WalletSource for WalletManager {
+    fn list_confirmed_utxos(&self) -> Result<Vec<lightning::events::bump_transaction::Utxo>, ()> {
+        let wallet_lock = self.bdk_wallet.lock().unwrap();
+        let utxos = wallet_lock.list_unspent();
+
+        Ok(utxos
+            .map(|utxo| Utxo {
+                outpoint: utxo.outpoint,
+                output: utxo.txout,
+                // Note: using these values https://github.com/lightningdevkit/rust-lightning/blob/bb5504ec62d4b7e9d5626d8b1a6de60d71e8d370/lightning/src/events/bump_transaction/mod.rs#L331
+                // TODO: dont do it like this
+                satisfaction_weight: 4 + 108,
+            })
+            .collect())
+    }
+
+    fn get_change_script(&self) -> Result<ScriptBuf, ()> {
+        Ok(self
+            .bdk_wallet
+            .lock()
+            .unwrap()
+            .next_unused_address(KeychainKind::Internal)
+            .script_pubkey())
+    }
+
+    fn sign_psbt(&self, mut psbt: bitcoin::Psbt) -> Result<Transaction, ()> {
+        let wallet_lock = self.bdk_wallet.lock().unwrap();
+
+        let mut sign_options = SignOptions::default();
+        sign_options.trust_witness_utxo = true;
+        let finalized = wallet_lock.sign(&mut psbt, sign_options).map_err(|_| ())?;
+        if !finalized {
+            return Err(());
+        }
+
+        Ok(psbt.extract_tx().map_err(|_| ())?)
     }
 }

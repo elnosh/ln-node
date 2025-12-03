@@ -18,6 +18,7 @@ use bitcoin::secp256k1::rand::RngCore;
 use bitcoin::{Address, Amount, BlockHash, OutPoint};
 use lightning::bolt11_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use lightning::chain::{ChannelMonitorUpdateStatus, Listen, Watch};
+use lightning::events::bump_transaction::BumpTransactionEventHandler;
 use lightning::io::Cursor;
 use lightning::ln::bolt11_payment::{
     payment_parameters_from_invoice, payment_parameters_from_variable_amount_invoice,
@@ -160,6 +161,15 @@ type PeerManager = ln::peer_handler::PeerManager<
     Arc<NodeLogger>,
     IgnoringMessageHandler,
     Arc<WalletManager>,
+>;
+
+// Types to handle LDK `BumpTransactionEvent` events
+type LdkWallet = lightning::events::bump_transaction::Wallet<Arc<WalletManager>, Arc<NodeLogger>>;
+pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
+    Arc<BitcoindRpcClient>,
+    Arc<LdkWallet>,
+    Arc<WalletManager>,
+    Arc<NodeLogger>,
 >;
 
 #[derive(Debug, Serialize)]
@@ -432,6 +442,8 @@ impl NodeBuilder {
                 <(BlockHash, ChannelManager)>::read(&mut BufReader::new(file), read_args)
                     .map_err(|e| format!("Could not read channel manager from disk {e}"))?;
 
+            // TODO: check if there's a way to start chain monitor with channel monitors instead of
+            // having to pass them like this
             for monitor in channel_monitor_references {
                 let update_status = chain_monitor
                     .watch_channel(monitor.get_funding_txo().0, monitor.clone())
@@ -624,9 +636,18 @@ impl Node {
             Ok::<(), Box<dyn Error + Send + Sync>>(())
         });
 
+        let ldk_wallet = LdkWallet::new(Arc::clone(&self.onchain_wallet), Arc::clone(&self.logger));
+        let bump_tx_handler = BumpTxEventHandler::new(
+            Arc::clone(&self.bitcoind_client),
+            Arc::new(ldk_wallet),
+            Arc::clone(&self.onchain_wallet),
+            Arc::clone(&self.logger),
+        );
+
         let event_handler = Arc::new(LdkEventHandler {
             bitcoind_client: Arc::clone(&self.bitcoind_client),
             onchain_wallet: Arc::clone(&self.onchain_wallet),
+            bump_tx_handler: Arc::new(bump_tx_handler),
             channel_manager: Arc::clone(&self.channel_manager),
             node_store: Arc::clone(&self.node_store),
             config: self.config.clone(),
@@ -740,7 +761,7 @@ impl Node {
         });
 
         // TODO:
-        // - broadcast announcements (if we have public channels)
+        // - broadcast node announcement (if we have public channels)
 
         // background task to listen for inbound connections
         let peer_manager_conn_listener = Arc::clone(&self.peer_manager);

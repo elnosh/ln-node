@@ -1,7 +1,7 @@
 use crate::{
     bitcoind_client::BitcoindRpcClient,
     config::Config,
-    node::ChannelManager,
+    node::{BumpTxEventHandler, ChannelManager},
     onchain_wallet::WalletManager,
     storage::{NodeStore, PaymentStatus},
 };
@@ -11,9 +11,10 @@ use lightning::{
 };
 use std::sync::Arc;
 
-pub struct LdkEventHandler {
+pub(crate) struct LdkEventHandler {
     pub(crate) bitcoind_client: Arc<BitcoindRpcClient>,
     pub(crate) onchain_wallet: Arc<WalletManager>,
+    pub(crate) bump_tx_handler: Arc<BumpTxEventHandler>,
     pub(crate) channel_manager: Arc<ChannelManager>,
     pub(crate) node_store: Arc<NodeStore>,
     pub(crate) config: Config,
@@ -212,13 +213,23 @@ impl LdkEventHandler {
                         if let Some(preimage) = payment_preimage {
                             self.channel_manager.claim_funds(preimage);
                         } else {
-                            log::debug!("got unknown payment hash {:?}. Ignoring...", payment_hash)
+                            log::debug!("Got unknown payment hash {:?}. Ignoring...", payment_hash)
                         }
                     }
                     _ => self.channel_manager.fail_htlc_backwards(&payment_hash),
                 }
             }
-            Event::PaymentClaimed { .. } => {}
+            Event::PaymentClaimed {
+                payment_hash,
+                amount_msat,
+                ..
+            } => {
+                log::info!(
+                    "Received payment {} for {} sats",
+                    payment_hash,
+                    amount_msat / 1000
+                );
+            }
             Event::PaymentFailed {
                 payment_id,
                 payment_hash,
@@ -270,8 +281,12 @@ impl LdkEventHandler {
 
             // -------- Onchain --------
             Event::SpendableOutputs { .. } => {}
-            Event::BumpTransaction(_bump_event) => {}
+            Event::BumpTransaction(bump_event) => {
+                self.bump_tx_handler.handle_event(&bump_event);
+            }
             Event::DiscardFunding { .. } => {}
+
+            // NOTE: only need to handle this if [`ChannelManager::unsafe_manual_funding_transaction_generated`] is used.
             Event::FundingTxBroadcastSafe { .. } => {}
 
             // -------- Onion Message --------
