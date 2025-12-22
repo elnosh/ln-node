@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -303,6 +303,10 @@ impl NodeBuilder {
         let network = self.config.network;
         let logger = Arc::new(NodeLogger {});
         let node_path = self.config.node_path.clone();
+        if !exists(&node_path)? {
+            fs::create_dir_all(&node_path)?;
+        }
+
         let kv_store_path = node_path.join("store");
         let kv_store = Arc::new(FilesystemStore::new(kv_store_path.clone()));
 

@@ -25,3 +25,4 @@ base64 = "0.22.1"
 home = "0.5.11"
 clap = { version = "4.5.45", features = ["derive"] }
 tokio-util = "0.7.16"
+serde_bytes = "0.11.19"
