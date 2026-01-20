@@ -21,13 +21,15 @@ use bitcoin::secp256k1::{PublicKey, Scalar, ecdsa};
 use bitcoin::{Address, Amount, FeeRate, NetworkKind, ScriptBuf, Transaction};
 use lightning::bolt11_invoice::RawBolt11Invoice;
 use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
-use lightning::events::bump_transaction::{Utxo, WalletSource};
+use lightning::events::bump_transaction::Utxo;
+use lightning::events::bump_transaction::sync::WalletSourceSync;
 use lightning::ln::inbound_payment::ExpandedKey;
-use lightning::ln::msgs::{DecodeError, UnsignedGossipMessage};
+use lightning::ln::msgs::UnsignedGossipMessage;
 use lightning::ln::script::ShutdownScript;
 use lightning::offers::invoice::UnsignedBolt12Invoice;
 use lightning::sign::{
-    EntropySource, InMemorySigner, KeysManager, NodeSigner, Recipient, SignerProvider,
+    ChangeDestinationSourceSync, EntropySource, InMemorySigner, KeysManager, NodeSigner,
+    PeerStorageKey, ReceiveAuthKey, Recipient, SignerProvider,
 };
 
 use crate::bitcoind_client::BitcoindRpcClient;
@@ -86,7 +88,7 @@ impl WalletManager {
         let cur = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap();
-        let ldk_keys_manager = KeysManager::new(&ldk_seed, cur.as_secs(), cur.subsec_nanos());
+        let ldk_keys_manager = KeysManager::new(&ldk_seed, cur.as_secs(), cur.subsec_nanos(), true);
 
         Ok(Self {
             ldk_keys_manager,
@@ -155,8 +157,16 @@ impl EntropySource for WalletManager {
 }
 
 impl NodeSigner for WalletManager {
-    fn get_inbound_payment_key(&self) -> ExpandedKey {
-        self.ldk_keys_manager.get_inbound_payment_key()
+    fn get_expanded_key(&self) -> ExpandedKey {
+        self.ldk_keys_manager.get_expanded_key()
+    }
+
+    fn get_peer_storage_key(&self) -> PeerStorageKey {
+        self.ldk_keys_manager.get_peer_storage_key()
+    }
+
+    fn get_receive_auth_key(&self) -> ReceiveAuthKey {
+        self.ldk_keys_manager.get_receive_auth_key()
     }
 
     fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
@@ -187,35 +197,22 @@ impl NodeSigner for WalletManager {
     fn sign_gossip_message(&self, msg: UnsignedGossipMessage<'_>) -> Result<ecdsa::Signature, ()> {
         self.ldk_keys_manager.sign_gossip_message(msg)
     }
+
+    fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
+        self.ldk_keys_manager.sign_message(msg)
+    }
 }
 
 impl SignerProvider for WalletManager {
     type EcdsaSigner = InMemorySigner;
 
-    fn generate_channel_keys_id(
-        &self,
-        inbound: bool,
-        channel_value_satoshis: u64,
-        user_channel_id: u128,
-    ) -> [u8; 32] {
-        self.ldk_keys_manager.generate_channel_keys_id(
-            inbound,
-            channel_value_satoshis,
-            user_channel_id,
-        )
-    }
-
-    fn derive_channel_signer(
-        &self,
-        channel_value_satoshis: u64,
-        channel_keys_id: [u8; 32],
-    ) -> Self::EcdsaSigner {
+    fn generate_channel_keys_id(&self, inbound: bool, user_channel_id: u128) -> [u8; 32] {
         self.ldk_keys_manager
-            .derive_channel_signer(channel_value_satoshis, channel_keys_id)
+            .generate_channel_keys_id(inbound, user_channel_id)
     }
 
-    fn read_chan_signer(&self, reader: &[u8]) -> Result<Self::EcdsaSigner, DecodeError> {
-        self.ldk_keys_manager.read_chan_signer(reader)
+    fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
+        self.ldk_keys_manager.derive_channel_signer(channel_keys_id)
     }
 
     fn get_destination_script(&self, _channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
@@ -239,7 +236,7 @@ impl SignerProvider for WalletManager {
     }
 }
 
-impl WalletSource for WalletManager {
+impl WalletSourceSync for WalletManager {
     fn list_confirmed_utxos(&self) -> Result<Vec<lightning::events::bump_transaction::Utxo>, ()> {
         let wallet_lock = self.bdk_wallet.lock().unwrap();
         let utxos = wallet_lock.list_unspent();
@@ -275,5 +272,16 @@ impl WalletSource for WalletManager {
         }
 
         Ok(psbt.extract_tx().map_err(|_| ())?)
+    }
+}
+
+impl ChangeDestinationSourceSync for WalletManager {
+    fn get_change_destination_script(&self) -> Result<ScriptBuf, ()> {
+        Ok(self
+            .bdk_wallet
+            .lock()
+            .unwrap()
+            .next_unused_address(KeychainKind::Internal)
+            .script_pubkey())
     }
 }

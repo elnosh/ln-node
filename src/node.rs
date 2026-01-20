@@ -18,11 +18,8 @@ use bitcoin::secp256k1::rand::RngCore;
 use bitcoin::{Address, Amount, BlockHash, OutPoint};
 use lightning::bolt11_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use lightning::chain::{ChannelMonitorUpdateStatus, Listen, Watch};
-use lightning::events::bump_transaction::BumpTransactionEventHandler;
+use lightning::events::bump_transaction::sync::BumpTransactionEventHandlerSync;
 use lightning::io::Cursor;
-use lightning::ln::bolt11_payment::{
-    payment_parameters_from_invoice, payment_parameters_from_variable_amount_invoice,
-};
 use lightning::ln::channel_state::ChannelDetails;
 use lightning::ln::channelmanager::{
     Bolt11InvoiceParameters, ChannelManagerReadArgs, PaymentId, Retry,
@@ -30,11 +27,12 @@ use lightning::ln::channelmanager::{
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::peer_handler::{MessageHandler, PeerDetails};
 use lightning::ln::types::ChannelId;
-use lightning::sign::{NodeSigner, Recipient};
+use lightning::routing::router::RouteParametersConfig;
+use lightning::sign::{KeysManager, NodeSigner, Recipient};
 use lightning::types::payment::PaymentHash;
 use lightning::util::errors::APIError;
 use lightning::util::persist::{
-    KVStore, SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+    KVStoreSync, SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
     SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::persist::{
@@ -61,7 +59,9 @@ use lightning::{
     sign::InMemorySigner,
     util::config::UserConfig,
 };
-use lightning_background_processor::{GossipSync, process_events_async};
+use lightning_background_processor::{
+    GossipSync, NO_LIQUIDITY_MANAGER, process_events_async_with_kv_store_sync,
+};
 use lightning_block_sync::poll::ChainPoller;
 use lightning_block_sync::{SpvClient, UnboundedCache, init};
 use lightning_block_sync::{gossip::TokioSpawner, http::HttpEndpoint};
@@ -116,6 +116,7 @@ pub(crate) type ChainMonitor = chain::chainmonitor::ChainMonitor<
     Arc<BitcoindRpcClient>,
     Arc<NodeLogger>,
     Arc<FilesystemStore>,
+    Arc<WalletManager>,
 >;
 
 pub(crate) type ChannelManager = channelmanager::ChannelManager<
@@ -161,15 +162,28 @@ type PeerManager = ln::peer_handler::PeerManager<
     Arc<NodeLogger>,
     IgnoringMessageHandler,
     Arc<WalletManager>,
+    Arc<ChainMonitor>,
 >;
 
 // Types to handle LDK `BumpTransactionEvent` events
-type LdkWallet = lightning::events::bump_transaction::Wallet<Arc<WalletManager>, Arc<NodeLogger>>;
-pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
+type LdkWallet =
+    lightning::events::bump_transaction::sync::WalletSync<Arc<WalletManager>, Arc<NodeLogger>>;
+
+pub(crate) type BumpTxEventHandler = BumpTransactionEventHandlerSync<
     Arc<BitcoindRpcClient>,
     Arc<LdkWallet>,
     Arc<WalletManager>,
     Arc<NodeLogger>,
+>;
+
+type OutputSweeper = lightning::util::sweep::OutputSweeperSync<
+    Arc<BitcoindRpcClient>,
+    Arc<WalletManager>,
+    Arc<BitcoindRpcClient>,
+    Arc<dyn chain::Filter + Send + Sync>,
+    Arc<FilesystemStore>,
+    Arc<NodeLogger>,
+    Arc<KeysManager>,
 >;
 
 #[derive(Debug, Serialize)]
@@ -373,12 +387,15 @@ impl NodeBuilder {
             ProbabilisticScoringFeeParameters::default(),
         ));
 
+        let peer_storage_key = wallet_manager.get_peer_storage_key();
         let chain_monitor = Arc::new(ChainMonitor::new(
             None,
             Arc::clone(&bitcoind_client),
             Arc::clone(&logger),
             Arc::clone(&bitcoind_client),
             Arc::clone(&kv_store),
+            Arc::clone(&wallet_manager),
+            peer_storage_key,
         ));
 
         let onion_message_router = Arc::new(OnionMessageRouter::new(
@@ -411,7 +428,7 @@ impl NodeBuilder {
                 Arc::clone(&wallet_manager),
                 Arc::clone(&wallet_manager),
                 Arc::clone(&wallet_manager),
-                self.ldk_config,
+                self.ldk_config.clone(),
                 chain_params,
                 cur_time,
             ))
@@ -437,7 +454,7 @@ impl NodeBuilder {
                 Arc::clone(&router),
                 Arc::clone(&onion_message_router),
                 Arc::clone(&logger),
-                self.ldk_config,
+                self.ldk_config.clone(),
                 channel_monitor_references.clone(),
             );
 
@@ -450,7 +467,7 @@ impl NodeBuilder {
             // having to pass them like this
             for monitor in channel_monitor_references {
                 let update_status = chain_monitor
-                    .watch_channel(monitor.get_funding_txo().0, monitor.clone())
+                    .watch_channel(monitor.channel_id(), monitor.clone())
                     .map_err(|_| "Could not pass Channel Monitors to the Chain Monitor")?;
                 assert!(update_status == ChannelMonitorUpdateStatus::Completed);
             }
@@ -481,6 +498,7 @@ impl NodeBuilder {
             route_handler: Arc::clone(&gossip_sync),
             onion_message_handler: Arc::clone(&onion_messenger),
             custom_message_handler: IgnoringMessageHandler {},
+            send_only_message_handler: Arc::clone(&chain_monitor),
         };
 
         let mut ephemeral_bytes = [0u8; 32];
@@ -569,7 +587,7 @@ impl Node {
             for monitor in monitors {
                 let locked_monitor = self
                     .chain_monitor
-                    .get_monitor(monitor.0)
+                    .get_monitor(monitor)
                     .map_err(|_| "monitor not found")?
                     .clone();
 
@@ -682,7 +700,7 @@ impl Node {
         let mobile_interruptable_platform = false;
 
         let handle = tokio::spawn(async move {
-            process_events_async(
+            process_events_async_with_kv_store_sync(
                 background_persister,
                 |e| background_event_handler.handle_event(e),
                 background_chain_mon,
@@ -690,6 +708,8 @@ impl Node {
                 Some(background_onion_messenger),
                 background_gossip_sync,
                 background_peer_man,
+                NO_LIQUIDITY_MANAGER,
+                Option::<Arc<OutputSweeper>>::None,
                 background_logger,
                 Some(background_scorer),
                 sleeper,
@@ -909,39 +929,25 @@ impl Node {
         invoice: Bolt11Invoice,
         amount_msat: Option<u64>,
     ) -> Result<PaymentId, Box<dyn Error>> {
-        let (payment_hash, recipient_onion, route_params) = match invoice.amount_milli_satoshis() {
-            Some(_) => {
-                payment_parameters_from_invoice(&invoice).map_err(|_| "could not parse invoice")?
-            }
-            None => {
-                let amount = amount_msat.ok_or("amount not specified for amountless invoice")?;
-                payment_parameters_from_variable_amount_invoice(&invoice, amount)
-                    .map_err(|_| "could not parse invoice")?
-            }
-        };
+        let amount = invoice
+            .amount_milli_satoshis()
+            .or(amount_msat)
+            .ok_or("Amount not specified")?;
 
-        // NOTE: future releases of LDK will have a `pay_for_bolt11_invoice` method that could be
-        // used instead.
-
-        let payment_id = PaymentId(payment_hash.0);
+        let payment_id = PaymentId(invoice.payment_hash().to_byte_array());
         self.channel_manager
-            .send_payment(
-                payment_hash,
-                recipient_onion,
+            .pay_for_bolt11_invoice(
+                &invoice,
                 payment_id,
-                route_params,
+                amount_msat,
+                RouteParametersConfig::default(),
                 Retry::Timeout(Duration::from_secs(15)),
             )
             // TODO: properly handle error
             .map_err(|e| format!("Could not make payment {:?}", e))?;
 
-        let amount = invoice
-            .amount_milli_satoshis()
-            // safe because we already checked above
-            .unwrap_or(amount_msat.unwrap());
-
         let payment = Payment {
-            payment_hash,
+            payment_hash: PaymentHash(invoice.payment_hash().to_byte_array()),
             payment_preimage: None,
             payment_id,
             direction: PaymentDirection::Outbound,

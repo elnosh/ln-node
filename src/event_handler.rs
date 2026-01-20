@@ -105,7 +105,7 @@ impl LdkEventHandler {
                     let onchain_balance = self.onchain_wallet.bdk_wallet.lock().unwrap().balance();
                     let confirmed_balance_sat = onchain_balance.confirmed.to_sat();
                     if confirmed_balance_sat < 10_000 {
-                        match self.channel_manager.force_close_without_broadcasting_txn(
+                        match self.channel_manager.force_close_broadcasting_latest_txn(
                             &temporary_channel_id,
                             &counterparty_node_id,
                             "unable to accept new channel".to_string(),
@@ -129,6 +129,7 @@ impl LdkEventHandler {
                     &temporary_channel_id,
                     &counterparty_node_id,
                     0,
+                    None,
                 ) {
                     Ok(_) => {
                         log::info!(
@@ -162,6 +163,11 @@ impl LdkEventHandler {
                     reason
                 )
             }
+
+            Event::SplicePending { .. } => {}
+            Event::SpliceFailed { .. } => {}
+            // This is generated if a splice is initiated with splice_channel
+            Event::FundingTransactionReadyForSigning { .. } => {}
 
             // -------- Payment-related events --------
             Event::PaymentSent {
@@ -263,6 +269,7 @@ impl LdkEventHandler {
                 payment_id: _,
                 payment_hash,
                 path,
+                ..
             } => {
                 // Safe to unwrap the hash. Will only be none for payments before LDK 0.0.104
                 log::info!("Payment {} took path {:?}", payment_hash.unwrap(), path);
@@ -270,14 +277,10 @@ impl LdkEventHandler {
             Event::PaymentForwarded { .. } => {}
             // Not handling bolt12 invoices manually.
             Event::InvoiceReceived { .. } => {}
-            // NOTE: This event will removed in future releases of LDK as the forwarding of HTLCs
-            // will be primarily driven by the background processor
-            Event::PendingHTLCsForwardable { time_forwardable } => {
-                tokio::time::sleep(time_forwardable).await;
-                self.channel_manager.process_pending_htlc_forwards();
-            }
             Event::HTLCIntercepted { .. } => {}
             Event::HTLCHandlingFailed { .. } => {}
+            Event::PersistStaticInvoice { .. } => {}
+            Event::StaticInvoiceRequested { .. } => {}
 
             // -------- Onchain --------
             Event::SpendableOutputs { .. } => {}

@@ -1,9 +1,9 @@
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::{Block, BlockHash, OutPoint, Transaction};
-use lightning::chain::Listen;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
 use lightning::chain::transaction::TransactionData;
+use lightning::chain::{BestBlock, Listen};
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::http::HttpEndpoint;
 use lightning_block_sync::rpc::RpcClient;
@@ -263,9 +263,9 @@ impl Listen for ChainListener {
             .unwrap();
     }
 
-    fn block_disconnected(&self, header: &bitcoin::block::Header, height: u32) {
-        self.channel_manager.block_disconnected(header, height);
-        self.chain_monitor.block_disconnected(header, height);
+    fn blocks_disconnected(&self, fork_point_block: BestBlock) {
+        self.channel_manager.blocks_disconnected(fork_point_block);
+        self.chain_monitor.blocks_disconnected(fork_point_block);
         // There's no notion of disconnecting blocks in BDK. See how to handle reorgs.
         // If this doesn't work, then will probably need to use this `Emitter`
         // https://docs.rs/bdk_bitcoind_rpc/latest/bdk_bitcoind_rpc/struct.Emitter.html

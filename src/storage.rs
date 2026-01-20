@@ -11,7 +11,7 @@ use lightning::{
     },
     types::payment::{PaymentHash, PaymentPreimage},
     util::{
-        persist::KVStore,
+        persist::KVStoreSync,
         ser::{Readable, Writeable, Writer},
     },
     write_tlv_fields,
@@ -178,7 +178,7 @@ impl NodeStore {
             PAYMENTS_PRIMARY_NAMESPACE,
             PAYMENTS_SECONDARY_NAMESPACE,
             &key,
-            &serialized,
+            serialized,
         )
     }
 
@@ -262,7 +262,7 @@ impl NodeStore {
             PEERS_PRIMARY_NAMESPACE,
             PEERS_SECONDARY_NAMESPACE,
             &key,
-            &serialized,
+            serialized,
         )
     }
 
